@@ -12,6 +12,10 @@ mcp-logs.txt
 # Baileys authentication data (IMPORTANT!)
 auth_info/
 
+# Transient QR artifacts (qr.txt embeds a live pairing token)
+qr.png
+qr.txt
+
 # SQLite Database (keep data local)
 data/
 
