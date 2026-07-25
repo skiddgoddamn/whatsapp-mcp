@@ -11,10 +11,8 @@ import {
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import path from "node:path";
-import { promises as fs } from "node:fs";
-import open from "open";
 import qrcodeTerminal from "qrcode-terminal";
-import QRCode from "qrcode";
+import { showQr, qrConnected } from "./qr-server.ts";
 
 import {
   initializeDatabase,
@@ -25,12 +23,9 @@ import {
 } from "./database.ts";
 
 const AUTH_DIR = path.join(import.meta.dirname, "..", "auth_info");
-const QR_PNG_PATH = path.join(import.meta.dirname, "..", "qr.png");
-const QR_TXT_PATH = path.join(import.meta.dirname, "..", "qr.txt");
 
-// Kept at module scope so they survive the recursive reconnect below.
+// Kept at module scope so it survives the recursive reconnect below.
 let reconnectAttempts = 0;
-let qrImageOpened = false;
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
 
@@ -129,29 +124,13 @@ export async function startWhatsAppConnection(
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // Local, instant QR. Rendered straight in the terminal and written to a
-        // PNG next to the repo, so the pairing token never leaves this machine
-        // (the old code POSTed it to quickchart.io) and the code shown is always
-        // the current one — no stale-QR race on the ~20s rotation.
-        logger.info(
-          { qrPng: QR_PNG_PATH },
-          "QR received — scan the terminal QR below (refreshes ~20s)"
-        );
-        // ASCII QR to STDERR only: stdout is the MCP JSON-RPC channel.
+        // Live QR on a local page that auto-refreshes on each ~20s rotation and
+        // shows "connected" once paired — no external service, no static image.
+        // ASCII to STDERR too (stdout is the MCP JSON-RPC channel) for headless.
+        showQr(qr, logger);
         qrcodeTerminal.generate(qr, { small: true }, (ascii: string) =>
           process.stderr.write("\n" + ascii + "\n")
         );
-        try {
-          await QRCode.toFile(QR_PNG_PATH, qr, { width: 320, margin: 2 });
-          await fs.writeFile(QR_TXT_PATH, qr, "utf8");
-          // Open the image once; it updates in place on later rotations.
-          if (!qrImageOpened) {
-            qrImageOpened = true;
-            await open(QR_PNG_PATH).catch(() => {});
-          }
-        } catch (e) {
-          logger.warn({ err: e }, "Failed to write QR image");
-        }
       }
 
       if (connection === "close") {
@@ -181,11 +160,8 @@ export async function startWhatsAppConnection(
         }
       } else if (connection === "open") {
         reconnectAttempts = 0;
-        qrImageOpened = false;
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
-        // Paired — drop the transient QR artifacts (qr.txt holds a pairing token).
-        fs.rm(QR_PNG_PATH, { force: true }).catch(() => {});
-        fs.rm(QR_TXT_PATH, { force: true }).catch(() => {});
+        qrConnected(logger);
       }
     }
 
