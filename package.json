@@ -1,12 +1,23 @@
 {
   "name": "whatsapp-mcp-ts",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "main": "src/main.ts",
   "type": "module",
-  "keywords": [],
-  "author": "jlucaso",
+  "bin": {
+    "whatsapp-mcp-ts": "src/main.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "keywords": ["mcp", "whatsapp", "baileys", "model-context-protocol"],
+  "author": "skiddgoddamn (fork of jlucaso/whatsapp-mcp-ts)",
   "license": "ISC",
-  "description": "",
+  "description": "WhatsApp MCP server (Baileys, pure-Node type-strip). Read, search and send WhatsApp messages from an MCP client.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/skiddgoddamn/whatsapp-mcp.git"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.8.0",
     "@whiskeysockets/baileys": "^6.7.16",

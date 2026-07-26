@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { pino } from "pino";
 import { initializeDatabase } from "./database.ts";
 import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
