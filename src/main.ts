@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { pino } from "pino";
 import { initializeDatabase } from "./database.ts";
-import { startWhatsAppConnection, type WhatsAppSocket } from "./whatsapp.ts";
+import { startWhatsAppConnection } from "./whatsapp.ts";
 import { startMcpServer } from "./mcp.ts";
 
 const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || '.';
@@ -24,15 +24,15 @@ const mcpLogger = pino(
 async function main() {
   mcpLogger.info("Starting WhatsApp MCP Server...");
 
-  let whatsappSocket: WhatsAppSocket | null = null;
-
   try {
     mcpLogger.info("Initializing database...");
     initializeDatabase();
     mcpLogger.info("Database initialized successfully.");
 
     mcpLogger.info("Attempting to connect to WhatsApp...");
-    whatsappSocket = await startWhatsAppConnection(waLogger);
+    // The socket is intentionally NOT captured here: reconnects replace it, and
+    // a captured reference would go stale. Consumers use getCurrentSocket().
+    await startWhatsAppConnection(waLogger);
     mcpLogger.info("WhatsApp connection process initiated.");
   } catch (error: any) {
     mcpLogger.fatal(
@@ -45,7 +45,7 @@ async function main() {
 
   try {
     mcpLogger.info("Starting MCP server...");
-    await startMcpServer(whatsappSocket, mcpLogger, waLogger);
+    await startMcpServer(mcpLogger, waLogger);
     mcpLogger.info("MCP Server started and listening.");
   } catch (error: any) {
     mcpLogger.fatal({ err: error }, "Failed to start MCP server");

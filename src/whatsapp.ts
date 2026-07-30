@@ -29,6 +29,78 @@ let reconnectAttempts = 0;
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
 
+// The reconnect path below builds a BRAND NEW socket. Callers that captured the
+// first one would keep writing into a dead websocket forever ("Connection
+// Closed" on every send while reads still work, because reads come from SQLite).
+// So the live socket lives here and consumers must go through getCurrentSocket().
+let currentSocket: WhatsAppSocket | null = null;
+let connectionOpen = false;
+let openWaiters: Array<() => void> = [];
+
+export function getCurrentSocket(): WhatsAppSocket | null {
+  return currentSocket;
+}
+
+export function isConnectionOpen(): boolean {
+  return connectionOpen;
+}
+
+function markConnectionOpen(): void {
+  connectionOpen = true;
+  const waiters = openWaiters;
+  openWaiters = [];
+  for (const resolve of waiters) resolve();
+}
+
+/**
+ * A freshly spawned process answers MCP calls within milliseconds, long before
+ * the websocket finishes opening — `sock.user` is already populated from cached
+ * creds, so a naive guard passes and the send dies with "Connection Closed".
+ * Wait for the socket to actually be open instead of failing the race.
+ */
+export function waitForConnectionOpen(timeoutMs = 20_000): Promise<boolean> {
+  if (connectionOpen) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      resolve(ok);
+    };
+    const timer = setTimeout(() => done(false), timeoutMs);
+    openWaiters.push(() => {
+      clearTimeout(timer);
+      done(true);
+    });
+  });
+}
+
+// WAMessageStatus numeric values (Baileys proto enum).
+const STATUS_ERROR = 0;
+const STATUS_SERVER_ACK = 2;
+
+// Baileys resolves sendMessage as soon as the frame is relayed; the server's
+// verdict arrives later as a messages.update. Without this the caller is told
+// "sent successfully" even when WhatsApp rejected the message (ack error 463),
+// which is indistinguishable from real delivery.
+const pendingAcks = new Map<string, (status: number) => void>();
+
+function resolveAck(msgId: string, status: number): void {
+  const resolve = pendingAcks.get(msgId);
+  if (resolve) {
+    pendingAcks.delete(msgId);
+    resolve(status);
+  }
+}
+
+export type SendOutcome = {
+  ok: boolean;
+  msgId?: string;
+  /** "delivered" | "rejected" | "unconfirmed" | "no-connection" | "error" */
+  state: string;
+  detail?: string;
+};
+
 function parseMessageForDb(msg: WAMessage): DbMessage | null {
   if (!msg.message || !msg.key || !msg.key.remoteJid) {
     return null;
@@ -118,6 +190,10 @@ export async function startWhatsAppConnection(
     shouldIgnoreJid: (jid) => isJidGroup(jid),
   });
 
+  // Publish the live socket immediately so reconnects propagate to consumers.
+  currentSocket = sock;
+  connectionOpen = false;
+
   sock.ev.process(async (events) => {
     if (events["connection.update"]) {
       const update = events["connection.update"];
@@ -134,6 +210,7 @@ export async function startWhatsAppConnection(
       }
 
       if (connection === "close") {
+        connectionOpen = false;
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
         logger.warn(
           `Connection closed. Reason: ${
@@ -160,6 +237,7 @@ export async function startWhatsAppConnection(
         }
       } else if (connection === "open") {
         reconnectAttempts = 0;
+        markConnectionOpen();
         logger.info(`Connection opened. WA user: ${sock.user?.name}`);
         qrConnected(logger);
       }
@@ -239,6 +317,21 @@ export async function startWhatsAppConnection(
       }
     }
 
+    if (events["messages.update"]) {
+      for (const { key, update } of events["messages.update"]) {
+        const status = (update as any)?.status;
+        if (key?.id != null && typeof status === "number") {
+          if (status === STATUS_ERROR) {
+            logger.warn(
+              { msgId: key.id, chatId: key.remoteJid },
+              "Server REJECTED the message (status ERROR) — it was NOT delivered"
+            );
+          }
+          resolveAck(key.id, status);
+        }
+      }
+    }
+
     if (events["chats.update"]) {
       logger.info(
         { count: events["chats.update"].length },
@@ -259,37 +352,104 @@ export async function startWhatsAppConnection(
   return sock;
 }
 
+/**
+ * Sends a message and reports what actually happened.
+ *
+ * Two things this deliberately does NOT do:
+ *  - trust a caller-held socket (it may be a dead one from before a reconnect);
+ *  - call a relayed frame a delivered message (WhatsApp can still reject it).
+ */
 export async function sendWhatsAppMessage(
   logger: P.Logger,
-  sock: WhatsAppSocket | null,
   recipientJid: string,
-  text: string
-): Promise<proto.WebMessageInfo | void> {
-  if (!sock || !sock.user) {
-    logger.error(
-      "Cannot send message: WhatsApp socket not connected or initialized."
-    );
-    return;
-  }
+  text: string,
+  opts: { connectTimeoutMs?: number; ackTimeoutMs?: number } = {}
+): Promise<SendOutcome> {
+  const { connectTimeoutMs = 20_000, ackTimeoutMs = 15_000 } = opts;
+
   if (!recipientJid) {
     logger.error("Cannot send message: Recipient JID is missing.");
-    return;
+    return { ok: false, state: "error", detail: "Recipient JID is missing." };
   }
   if (!text) {
     logger.error("Cannot send message: Message text is empty.");
-    return;
+    return { ok: false, state: "error", detail: "Message text is empty." };
   }
 
+  if (!connectionOpen) {
+    logger.info("Socket not open yet — waiting before sending.");
+    const opened = await waitForConnectionOpen(connectTimeoutMs);
+    if (!opened) {
+      logger.error("Cannot send message: WhatsApp connection is not open.");
+      return {
+        ok: false,
+        state: "no-connection",
+        detail: `WhatsApp connection was not open after ${Math.round(connectTimeoutMs / 1000)}s.`,
+      };
+    }
+  }
+
+  const sock = currentSocket;
+  if (!sock) {
+    logger.error("Cannot send message: no active WhatsApp socket.");
+    return { ok: false, state: "no-connection", detail: "No active socket." };
+  }
+
+  let msgId: string | undefined;
   try {
     logger.info(
       `Sending message to ${recipientJid}: ${text.substring(0, 50)}...`
     );
     const normalizedJid = jidNormalizedUser(recipientJid);
     const result = await sock.sendMessage(normalizedJid, { text: text });
-    logger.info({ msgId: result?.key.id }, "Message sent successfully");
-    return result;
-  } catch (error) {
+    msgId = result?.key?.id ?? undefined;
+    if (!msgId) {
+      return { ok: false, state: "error", detail: "No message id returned." };
+    }
+  } catch (error: any) {
     logger.error({ err: error, recipientJid }, "Failed to send message");
-    return;
+    return { ok: false, state: "error", detail: error?.message ?? String(error) };
   }
+
+  // Frame relayed. Now wait for the server's verdict.
+  const status = await new Promise<number | null>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingAcks.delete(msgId!);
+      resolve(null);
+    }, ackTimeoutMs);
+    pendingAcks.set(msgId!, (s) => {
+      clearTimeout(timer);
+      resolve(s);
+    });
+  });
+
+  if (status === STATUS_ERROR) {
+    logger.error(
+      { msgId, recipientJid },
+      "Message REJECTED by WhatsApp (ack error) — not delivered"
+    );
+    return {
+      ok: false,
+      msgId,
+      state: "rejected",
+      detail:
+        "WhatsApp rejected the message (ack error). Common causes: the number is not on WhatsApp, or the account is rate-limited/restricted for messaging strangers.",
+    };
+  }
+
+  if (status !== null && status >= STATUS_SERVER_ACK) {
+    logger.info({ msgId, status }, "Message delivered (server acknowledged)");
+    return { ok: true, msgId, state: "delivered" };
+  }
+
+  logger.warn(
+    { msgId, status },
+    "Message relayed but not acknowledged in time — delivery unconfirmed"
+  );
+  return {
+    ok: true,
+    msgId,
+    state: "unconfirmed",
+    detail: `Relayed but no server acknowledgement within ${Math.round(ackTimeoutMs / 1000)}s — delivery is not confirmed.`,
+  };
 }

@@ -10,7 +10,10 @@ wa-logs.txt
 mcp-logs.txt
 
 # Baileys authentication data (IMPORTANT!)
+# Glob, not just `auth_info/`: a logged-out session gets renamed aside
+# (auth_info.loggedout-YYYYMMDD) and those backups hold live credentials too.
 auth_info/
+auth_info*
 
 # Transient QR artifacts (qr.txt embeds a live pairing token)
 qr.png

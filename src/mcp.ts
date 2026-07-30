@@ -14,7 +14,11 @@ import {
   searchMessages,
 } from "./database.ts";
 
-import { sendWhatsAppMessage, type WhatsAppSocket } from "./whatsapp.ts";
+import {
+  sendWhatsAppMessage,
+  getCurrentSocket,
+  type WhatsAppSocket,
+} from "./whatsapp.ts";
 import { type P } from "pino";
 
 function formatDbMessageForJson(msg: DbMessage) {
@@ -52,7 +56,6 @@ function formatDbChatForJson(chat: DbChat) {
 }
 
 export async function startMcpServer(
-  sock: WhatsAppSocket | null,
   mcpLogger: P.Logger,
   waLogger: P.Logger,
 ): Promise<void> {
@@ -397,7 +400,7 @@ export async function startMcpServer(
     },
     async ({ recipient, message }) => {
       mcpLogger.info(`[MCP Tool] Executing send_message to ${recipient}`);
-      if (!sock) {
+      if (!getCurrentSocket()) {
         mcpLogger.error(
           "[MCP Tool Error] send_message failed: WhatsApp socket is not available.",
         );
@@ -431,33 +434,46 @@ export async function startMcpServer(
       }
 
       try {
-        const result = await sendWhatsAppMessage(
+        const outcome = await sendWhatsAppMessage(
           waLogger,
-          sock,
           normalizedRecipient,
           message,
         );
 
-        if (result && result.key && result.key.id) {
+        // Report what the SERVER said, not merely that a frame left the socket.
+        // A relayed-but-rejected message used to be reported as success, which
+        // makes a failed broadcast look like a delivered one.
+        if (outcome.state === "delivered") {
           return {
             content: [
               {
                 type: "text",
-                text: `Message sent successfully to ${normalizedRecipient} (ID: ${result.key.id}).`,
-              },
-            ],
-          };
-        } else {
-          return {
-            isError: true,
-            content: [
-              {
-                type: "text",
-                text: `Failed to send message to ${normalizedRecipient}. See server logs for details.`,
+                text: `Message delivered to ${normalizedRecipient} (ID: ${outcome.msgId}) — acknowledged by WhatsApp.`,
               },
             ],
           };
         }
+
+        if (outcome.state === "unconfirmed") {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Message sent to ${normalizedRecipient} (ID: ${outcome.msgId}), but NOT confirmed: ${outcome.detail}`,
+              },
+            ],
+          };
+        }
+
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: `Failed to send message to ${normalizedRecipient} [${outcome.state}]. ${outcome.detail ?? "See server logs for details."}`,
+            },
+          ],
+        };
       } catch (error: any) {
         mcpLogger.error(
           `[MCP Tool Error] send_message failed for ${recipient}: ${error.message}`,
